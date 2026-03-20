@@ -1,7 +1,6 @@
 package migrate
 
 import (
-	"bytes"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -187,19 +186,8 @@ func (m *migrate) execMigration(query []byte) (errResp error) {
 		}
 	}()
 
-	for {
-		index := bytes.Index(query, []byte(";"))
-		if index == -1 {
-			break
-		}
-
-		stmt := query[:index+1]
-		query = query[index+1:]
-		if len(strings.TrimSpace(string(stmt))) == 0 {
-			continue
-		}
-
-		if _, err := tx.Exec(string(stmt)); err != nil {
+	for _, stmt := range splitSQLStatements(query) {
+		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}
 	}
@@ -209,6 +197,136 @@ func (m *migrate) execMigration(query []byte) (errResp error) {
 	}
 
 	return errResp
+}
+
+func splitSQLStatements(query []byte) []string {
+	script := string(query)
+	statements := make([]string, 0)
+	var builder strings.Builder
+
+	inSingleQuote := false
+	inDoubleQuote := false
+	inBacktickQuote := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(script); i++ {
+		ch := script[i]
+		next := byte(0)
+		if i+1 < len(script) {
+			next = script[i+1]
+		}
+
+		if inLineComment {
+			builder.WriteByte(ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+
+		if inBlockComment {
+			builder.WriteByte(ch)
+			if ch == '*' && next == '/' {
+				builder.WriteByte(next)
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+
+		if inSingleQuote {
+			builder.WriteByte(ch)
+			if ch == '\\' && next != 0 {
+				builder.WriteByte(next)
+				i++
+				continue
+			}
+			if ch == '\'' {
+				if next == '\'' {
+					builder.WriteByte(next)
+					i++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+
+		if inDoubleQuote {
+			builder.WriteByte(ch)
+			if ch == '\\' && next != 0 {
+				builder.WriteByte(next)
+				i++
+				continue
+			}
+			if ch == '"' {
+				if next == '"' {
+					builder.WriteByte(next)
+					i++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+
+		if inBacktickQuote {
+			builder.WriteByte(ch)
+			if ch == '`' {
+				if next == '`' {
+					builder.WriteByte(next)
+					i++
+					continue
+				}
+				inBacktickQuote = false
+			}
+			continue
+		}
+
+		if ch == '-' && next == '-' {
+			builder.WriteByte(ch)
+			builder.WriteByte(next)
+			i++
+			inLineComment = true
+			continue
+		}
+
+		if ch == '/' && next == '*' {
+			builder.WriteByte(ch)
+			builder.WriteByte(next)
+			i++
+			inBlockComment = true
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingleQuote = true
+			builder.WriteByte(ch)
+		case '"':
+			inDoubleQuote = true
+			builder.WriteByte(ch)
+		case '`':
+			inBacktickQuote = true
+			builder.WriteByte(ch)
+		case ';':
+			statement := strings.TrimSpace(builder.String())
+			if statement != "" {
+				statements = append(statements, statement)
+			}
+			builder.Reset()
+		default:
+			builder.WriteByte(ch)
+		}
+	}
+
+	statement := strings.TrimSpace(builder.String())
+	if statement != "" {
+		statements = append(statements, statement)
+	}
+
+	return statements
 }
 
 func (m *migrate) addMigration(version string) error {

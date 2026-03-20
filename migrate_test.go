@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"database/sql"
+	"slices"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -137,6 +138,41 @@ func TestSetVersion(t *testing.T) {
 
 		if version != currentVersion {
 			t.Errorf("Expected version %s, got %s", currentVersion, version)
+		}
+	})
+}
+
+func TestSplitSQLStatements(t *testing.T) {
+	t.Run("should keep semicolons inside quoted strings", func(t *testing.T) {
+		query := []byte(`
+INSERT INTO example (payload) VALUES ('a:2:{i:1;s:7:"January";i:2;s:8:"February";}');
+INSERT INTO example (payload) VALUES ('ok');
+`)
+
+		statements := splitSQLStatements(query)
+
+		expected := []string{
+			`INSERT INTO example (payload) VALUES ('a:2:{i:1;s:7:"January";i:2;s:8:"February";}')`,
+			`INSERT INTO example (payload) VALUES ('ok')`,
+		}
+
+		if !slices.Equal(statements, expected) {
+			t.Fatalf("expected statements %v, got %v", expected, statements)
+		}
+	})
+
+	t.Run("should keep final statement without trailing semicolon", func(t *testing.T) {
+		query := []byte("CREATE TABLE test (id INTEGER); INSERT INTO test (id) VALUES (1)")
+
+		statements := splitSQLStatements(query)
+
+		expected := []string{
+			"CREATE TABLE test (id INTEGER)",
+			"INSERT INTO test (id) VALUES (1)",
+		}
+
+		if !slices.Equal(statements, expected) {
+			t.Fatalf("expected statements %v, got %v", expected, statements)
 		}
 	})
 }
