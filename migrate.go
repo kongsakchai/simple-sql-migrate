@@ -88,7 +88,7 @@ func Migrate(db *sql.DB, opts ...Options) error {
 		return nil
 	}
 
-	if curVersion <= opt.Version {
+	if curVersion <= opt.Version || opt.Version == VersionUp {
 		return migrateUp(db, opt)
 	}
 
