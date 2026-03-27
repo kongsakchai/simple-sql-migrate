@@ -97,6 +97,17 @@ func Migrate(db *sql.DB, opts ...Options) error {
 
 // Helper
 
+func GetRepeatAction(repeat string) RepeatAction {
+	switch strings.ToLower(repeat) {
+	case "all":
+		return RepeatAll
+	case "last":
+		return RepeatLast
+	default:
+		return NoRepeat
+	}
+}
+
 func checkTableName(tableName ...string) string {
 	if len(tableName) > 0 && tableName[0] != "" {
 		return tableName[0]
