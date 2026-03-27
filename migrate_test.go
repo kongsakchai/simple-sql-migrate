@@ -283,6 +283,21 @@ func TestFilterUpMigrationFiles(t *testing.T) {
 			repeat:   RepeatAll,
 			expected: []migrationFile{{Version: "001", Filename: "001_example.up.sql"}, {Version: "002", Filename: "002_example.up.sql"}, {Version: "003", Filename: "003_example.up.sql"}},
 		},
+		{
+			name: "should return last up migration file when version file after current version but repeat is RepeatLast",
+			files: []string{
+				"001_example.up.sql",
+				"002_example.up.sql",
+				"003_example.up.sql",
+			},
+			cur:    "002",
+			target: VersionUp,
+			repeat: RepeatLast,
+			expected: []migrationFile{
+				{Version: "002", Filename: "002_example.up.sql"},
+				{Version: "003", Filename: "003_example.up.sql"},
+			},
+		},
 	}
 
 	for _, tc := range testcases {

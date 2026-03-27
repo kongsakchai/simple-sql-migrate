@@ -55,7 +55,7 @@ func initTable(db *sql.DB, tableName string) error {
 }
 
 func getVersion(db *sql.DB, tableName string) (string, error) {
-	query := fmt.Sprintf("SELECT version FROM %s ORDER BY timestamp DESC LIMIT 1", tableName)
+	query := fmt.Sprintf("SELECT version FROM %s ORDER BY version DESC LIMIT 1", tableName)
 	var version string
 	err := db.QueryRow(query).Scan(&version)
 	if err == sql.ErrNoRows {
