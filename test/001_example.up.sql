@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS USER (
     json_data text NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS address(
+CREATE TABLE IF NOT EXISTS address (
     id text PRIMARY KEY,
     user_id text NOT NULL,
     street text NOT NULL,
@@ -13,4 +13,3 @@ CREATE TABLE IF NOT EXISTS address(
     state text NOT NULL,
     zip_code text NOT NULL
 );
-
