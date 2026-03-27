@@ -287,8 +287,16 @@ func TestFilterUpMigrationFiles(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
+			// arrange
+			opt := Options{
+				curVersion:       tc.cur,
+				Version:          tc.target,
+				Repeat:           tc.repeat,
+				VersionSeparator: VersionSeparator,
+			}
+
 			// act
-			result := filterUpMigrationFiles(tc.files, tc.cur, tc.target, VersionSeparator, tc.repeat)
+			result := filterUpMigrationFiles(tc.files, opt)
 
 			// assert
 			assert.Equal(t, tc.expected, result)
@@ -371,8 +379,16 @@ func TestFilterDownMigrationFiles(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
+			// arrange
+			opt := Options{
+				curVersion:       tc.cur,
+				Version:          tc.target,
+				Repeat:           tc.repeat,
+				VersionSeparator: VersionSeparator,
+			}
+
 			// act
-			result := filterDownMigrationFiles(tc.files, tc.cur, tc.target, VersionSeparator, tc.repeat)
+			result := filterDownMigrationFiles(tc.files, opt)
 
 			// assert
 			assert.Equal(t, tc.expected, result)

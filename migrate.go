@@ -26,6 +26,8 @@ const (
 )
 
 type Options struct {
+	curVersion string
+
 	TableName        string
 	Source           string
 	Version          string
@@ -88,6 +90,7 @@ func Migrate(db *sql.DB, opts ...Options) error {
 		return nil
 	}
 
+	opt.curVersion = curVersion
 	if curVersion <= opt.Version || opt.Version == VersionUp {
 		return migrateUp(db, opt)
 	}
@@ -159,18 +162,18 @@ type migrationFile struct {
 	Args     []string
 }
 
-func filterUpMigrationFiles(files []string, cur, target, separator string, repeat RepeatAction) []migrationFile {
+func filterUpMigrationFiles(files []string, opt Options) []migrationFile {
 	var result []migrationFile
 	for _, file := range files {
-		version := strings.Split(file, separator)[0]
-		if version > target && target != VersionUp {
+		version := strings.Split(file, opt.VersionSeparator)[0]
+		if version > opt.Version && opt.Version != VersionUp {
 			continue
 		}
 		// skip if version file is less than or equal to current version, and repeat is not RepeatAll
-		if version < cur && repeat != RepeatAll {
+		if version < opt.curVersion && opt.Repeat != RepeatAll {
 			continue
 		}
-		if version == cur && repeat == NoRepeat {
+		if version == opt.curVersion && opt.Repeat == NoRepeat {
 			continue
 		}
 		result = append(result, migrationFile{Version: version, Filename: file})
@@ -182,18 +185,18 @@ func filterUpMigrationFiles(files []string, cur, target, separator string, repea
 	return result
 }
 
-func filterDownMigrationFiles(files []string, cur, target, separator string, repeat RepeatAction) []migrationFile {
+func filterDownMigrationFiles(files []string, opt Options) []migrationFile {
 	var result []migrationFile
 	for _, file := range files {
-		version := strings.Split(file, separator)[0]
-		if version < target && target != VersionDown {
+		version := strings.Split(file, opt.VersionSeparator)[0]
+		if version < opt.Version && opt.Version != VersionDown {
 			continue
 		}
 		// skip if version file is greater than or equal to current version, and repeat is not RepeatAll
-		if version > cur && repeat != RepeatAll {
+		if version > opt.curVersion && opt.Repeat != RepeatAll {
 			continue
 		}
-		if version == cur && repeat == NoRepeat {
+		if version == opt.curVersion && opt.Repeat == NoRepeat {
 			continue
 		}
 
@@ -214,7 +217,7 @@ func migrateUp(db *sql.DB, opt Options) error {
 	if err != nil {
 		return err
 	}
-	migrations := filterUpMigrationFiles(files, opt.Version, opt.Version, opt.VersionSeparator, opt.Repeat)
+	migrations := filterUpMigrationFiles(files, opt)
 	for _, m := range migrations {
 		filename := path.Join(opt.Source, m.Filename)
 		b, err := os.ReadFile(filename)
@@ -236,7 +239,7 @@ func migrateDown(db *sql.DB, opt Options) error {
 	if err != nil {
 		return err
 	}
-	migrations := filterDownMigrationFiles(files, opt.Version, opt.Version, opt.VersionSeparator, opt.Repeat)
+	migrations := filterDownMigrationFiles(files, opt)
 	for _, m := range migrations {
 		filename := path.Join(opt.Source, m.Filename)
 		b, err := os.ReadFile(filename)
