@@ -140,6 +140,39 @@ func TestHelper(t *testing.T) {
 	})
 }
 
+func TestGetRepeatAction(t *testing.T) {
+	type testcase struct {
+		name     string
+		req      string
+		expected RepeatAction
+	}
+
+	testcases := []testcase{
+		{
+			name:     "should return no repeat when req is empty",
+			expected: NoRepeat,
+		},
+		{
+			name:     "should return repeat all when req is 'all'",
+			req:      "all",
+			expected: RepeatAll,
+		},
+		{
+			name:     "should return repeat last when req is 'last'",
+			req:      "last",
+			expected: RepeatLast,
+		},
+	}
+
+	for _, tc := range testcases {
+		// act
+		res := GetRepeatAction(tc.req)
+
+		// assert
+		assert.Equal(t, tc.expected, res)
+	}
+}
+
 func TestGetMigrationFiles(t *testing.T) {
 	dir := "./test"
 	t.Run("should return migration files with up suffix", func(t *testing.T) {
@@ -625,8 +658,8 @@ func TestMigrateDown(t *testing.T) {
 func TestAddMigrateStatements(t *testing.T) {
 	opt := Options{TableName: DefaultTableName}
 
-	assert.Equal(t, "INSERT INTO schema_migrations (version) VALUES ('001') ON CONFLICT(version) DO UPDATE SET timestamp = CURRENT_TIMESTAMP", addMigrateUpStatements("001", opt))
-	assert.Equal(t, "DELETE FROM schema_migrations WHERE version = '001'", addMigrateDownStatements("001", opt))
+	assert.Equal(t, "INSERT INTO schema_migrations (version) VALUES ('001');", addVersion("001", opt))
+	assert.Equal(t, "DELETE FROM schema_migrations WHERE version = '001'", removeVersion("001", opt))
 }
 
 func TestExecScripts(t *testing.T) {

@@ -223,7 +223,7 @@ func migrateUp(db *sql.DB, opt Options) error {
 		}
 
 		statements := splitSQLStatements(b)
-		statements = append(statements, addMigrateUpStatements(m.Version, opt))
+		statements = append(statements, removeVersion(m.Version, opt), addVersion(m.Version, opt))
 		if err := execScripts(db, statements); err != nil {
 			return err
 		}
@@ -245,7 +245,7 @@ func migrateDown(db *sql.DB, opt Options) error {
 		}
 
 		statements := splitSQLStatements(b)
-		statements = append(statements, addMigrateDownStatements(m.Version, opt))
+		statements = append(statements, removeVersion(m.Version, opt))
 		if err := execScripts(db, statements); err != nil {
 			return err
 		}
@@ -253,11 +253,11 @@ func migrateDown(db *sql.DB, opt Options) error {
 	return nil
 }
 
-func addMigrateUpStatements(version string, opt Options) string {
-	return fmt.Sprintf("INSERT INTO %s (version) VALUES ('%s') ON CONFLICT(version) DO UPDATE SET timestamp = CURRENT_TIMESTAMP", opt.TableName, version)
+func addVersion(version string, opt Options) string {
+	return fmt.Sprintf("INSERT INTO %s (version) VALUES ('%s');", opt.TableName, version)
 }
 
-func addMigrateDownStatements(version string, opt Options) string {
+func removeVersion(version string, opt Options) string {
 	return fmt.Sprintf("DELETE FROM %s WHERE version = '%s'", opt.TableName, version)
 }
 
