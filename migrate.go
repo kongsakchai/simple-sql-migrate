@@ -1,64 +1,185 @@
 package migrate
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
-type RepeatAction int
-
+// Sentinel versions for Options.Version.
 const (
-	NoRepeat RepeatAction = iota
-	RepeatAll
-	RepeatLast
-
-	VersionUp   = "VERSION_UP"
+	// VersionUp applies all pending migrations.
+	VersionUp = "VERSION_UP"
+	// VersionDown rolls back all applied migrations.
 	VersionDown = "VERSION_DOWN"
 
-	DefaultTableName = "schema_migrations"
-	SuffixUp         = "up.sql"
-	SuffixDown       = "down.sql"
-	VersionSeparator = "_"
+	defaultTimeout   = 10 * time.Minute
+	defaultTableName = "schema_migrations"
+	suffixUp         = "up.sql"
+	suffixDown       = "down.sql"
+
+	versionSeparator = "_"
 )
 
+// ErrNoSource is returned when Options.Source is empty.
+var ErrNoSource = errors.New("simple migration: no migration source")
+
+// Options controls a migration run.
 type Options struct {
-	curVersion string
-
-	TableName        string
-	Source           string
-	Version          string
-	Repeat           RepeatAction
-	VersionSeparator string
+	TableName string        // version tracking table (default schema_migrations)
+	Source    string        // directory containing migration files (required)
+	Version   string        // target version, or the VersionUp / VersionDown sentinel
+	Timeout   time.Duration // overall migration timeout (default 10 minutes)
 }
 
-var defaultOptions = Options{
-	TableName:        DefaultTableName,
-	Source:           "",
-	Version:          VersionUp,
-	Repeat:           NoRepeat,
-	VersionSeparator: VersionSeparator,
+// Migrate moves the database to opt.Version: up when the target is ahead of
+// (or equal to) the current version, down when it is behind. Each migration
+// file runs in its own transaction together with its version bookkeeping.
+func Migrate(db *sql.DB, opts ...Options) error {
+	opt, err := prepareOptions(opts...)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), opt.Timeout)
+	defer cancel()
+
+	if _, err := os.Stat(opt.Source); err != nil {
+		return fmt.Errorf("simple migration: %w", err)
+	}
+	if err := prepareTable(ctx, db, opt.TableName); err != nil {
+		return fmt.Errorf("simple migration: %w", err)
+	}
+
+	cur, err := currentVersion(ctx, db, opt.TableName)
+	if err != nil {
+		return fmt.Errorf("simple migration: %w", err)
+	}
+
+	if opt.Version == VersionDown || cur > opt.Version {
+		return migrateDown(ctx, db, cur, opt)
+	}
+
+	return migrateUp(ctx, db, cur, opt)
 }
 
-func initTable(db *sql.DB, tableName string) error {
+func prepareOptions(opts ...Options) (Options, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.TableName == "" {
+		opt.TableName = defaultTableName
+	}
+	if opt.Version == "" {
+		opt.Version = VersionUp
+	}
+	if opt.Timeout == 0 {
+		opt.Timeout = defaultTimeout
+	}
+	if opt.Source == "" {
+		return Options{}, ErrNoSource
+	}
+	return opt, nil
+}
+
+// execute
+
+func migrateUp(ctx context.Context, db *sql.DB, cur string, opt Options) error {
+	files, err := migrateUpFiles(cur, opt)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range files {
+		filename := filepath.Join(opt.Source, m.Filename)
+		b, err := os.ReadFile(filename)
+		if err != nil {
+			return fmt.Errorf("simple migration: %w", err)
+		}
+
+		statements := []string{string(b), addVersion(m.Version, opt)}
+		if err := execScripts(ctx, db, statements); err != nil {
+			return fmt.Errorf("simple migration: apply %s: %w", m.Filename, err)
+		}
+	}
+
+	return nil
+}
+
+func migrateDown(ctx context.Context, db *sql.DB, cur string, opt Options) error {
+	files, err := migrateDownFiles(cur, opt)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range files {
+		filename := filepath.Join(opt.Source, m.Filename)
+		b, err := os.ReadFile(filename)
+		if err != nil {
+			return fmt.Errorf("simple migration: %w", err)
+		}
+
+		statements := []string{string(b), removeVersion(m.Version, opt)}
+		if err := execScripts(ctx, db, statements); err != nil {
+			return fmt.Errorf("simple migration: apply %s: %w", m.Filename, err)
+		}
+	}
+	return nil
+}
+
+func addVersion(version string, opt Options) string {
+	return fmt.Sprintf("INSERT INTO %s (version) VALUES ('%s');", opt.TableName, escapeSQLString(version))
+}
+
+func removeVersion(version string, opt Options) string {
+	return fmt.Sprintf("DELETE FROM %s WHERE version = '%s';", opt.TableName, escapeSQLString(version))
+}
+
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+func execScripts(ctx context.Context, db *sql.DB, statements []string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Rollback is a no-op once the transaction is committed.
+	defer func() { _ = tx.Rollback() }()
+
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func prepareTable(ctx context.Context, db *sql.DB, tableName string) error {
 	query := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			version VARCHAR(100) PRIMARY KEY,
-			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-		)
-	`, tableName)
-	_, err := db.Exec(query)
+	CREATE TABLE IF NOT EXISTS %s (
+		version VARCHAR(100) PRIMARY KEY,
+		timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`, tableName)
+	_, err := db.ExecContext(ctx, query)
 	return err
 }
 
-func getVersion(db *sql.DB, tableName string) (string, error) {
+// currentVersion returns the highest applied version. Versions are compared
+// lexicographically, the same rule used everywhere else in this package.
+func currentVersion(ctx context.Context, db *sql.DB, tableName string) (string, error) {
 	query := fmt.Sprintf("SELECT version FROM %s ORDER BY version DESC LIMIT 1", tableName)
 	var version string
-	err := db.QueryRow(query).Scan(&version)
-	if err == sql.ErrNoRows {
+	err := db.QueryRowContext(ctx, query).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	} else if err != nil {
 		return "", err
@@ -66,349 +187,91 @@ func getVersion(db *sql.DB, tableName string) (string, error) {
 	return version, nil
 }
 
-func Version(db *sql.DB, tableName ...string) (string, error) {
-	tb := checkTableName(tableName...)
-	if err := initTable(db, tb); err != nil {
-		return "", err
-	}
-
-	return getVersion(db, tb)
-}
-
-func Migrate(db *sql.DB, opts ...Options) error {
-	opt := checkOptions(opts...)
-	if _, err := os.Stat(opt.Source); os.IsNotExist(err) {
-		return err
-	}
-
-	curVersion, err := Version(db, opt.TableName)
-	if err != nil {
-		return err
-	}
-
-	if curVersion == opt.Version && opt.Repeat == NoRepeat {
-		return nil
-	}
-
-	opt.curVersion = curVersion
-	if curVersion <= opt.Version || opt.Version == VersionUp {
-		return migrateUp(db, opt)
-	}
-
-	return migrateDown(db, opt)
-}
-
-// Helper
-
-func GetRepeatAction(repeat string) RepeatAction {
-	switch strings.ToLower(repeat) {
-	case "all":
-		return RepeatAll
-	case "last":
-		return RepeatLast
-	default:
-		return NoRepeat
-	}
-}
-
-func checkTableName(tableName ...string) string {
-	if len(tableName) > 0 && tableName[0] != "" {
-		return tableName[0]
-	}
-	return defaultOptions.TableName
-}
-
-func checkOptions(opts ...Options) Options {
-	opt := defaultOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-	if opt.TableName == "" {
-		opt.TableName = DefaultTableName
-	}
-	if opt.VersionSeparator == "" {
-		opt.VersionSeparator = VersionSeparator
-	}
-	if opt.Version == "" {
-		opt.Version = VersionUp
-	}
-	return opt
-}
-
 // migration file
 
-func getMigrationFiles(source string, suffix string) ([]string, error) {
+type migrationFile struct {
+	Version  string
+	Filename string
+}
+
+func migrationFiles(source string, suffix string) ([]migrationFile, error) {
 	files, err := os.ReadDir(source)
 	if err != nil {
 		return nil, err
 	}
 
-	var migrationFiles []string
+	var migrationFiles []migrationFile
 	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(file.Name(), suffix) {
-			migrationFiles = append(migrationFiles, file.Name())
+
+		n := file.Name()
+		if !strings.HasSuffix(n, suffix) {
+			continue
 		}
+		version, _, found := strings.Cut(n, versionSeparator)
+		if !found {
+			continue
+		}
+		migrationFiles = append(migrationFiles, migrationFile{Version: version, Filename: n})
 	}
 
 	return migrationFiles, nil
 }
 
-type migrationFile struct {
-	Version  string
-	Filename string
-	Args     []string
-}
-
-func filterUpMigrationFiles(files []string, opt Options) []migrationFile {
-	var result []migrationFile
-	for _, file := range files {
-		version := strings.Split(file, opt.VersionSeparator)[0]
-		if version > opt.Version && opt.Version != VersionUp {
-			continue
-		}
-		// skip if version file is less than or equal to current version, and repeat is not RepeatAll
-		if version < opt.curVersion && opt.Repeat != RepeatAll {
-			continue
-		}
-		if version == opt.curVersion && opt.Repeat == NoRepeat {
-			continue
-		}
-		result = append(result, migrationFile{Version: version, Filename: file})
+// migrateUpFiles returns the up migrations to apply, i.e. every file with
+// cur < version <= opt.Version, sorted ascending.
+func migrateUpFiles(cur string, opt Options) ([]migrationFile, error) {
+	files, err := migrationFiles(opt.Source, suffixUp)
+	if err != nil {
+		return nil, err
 	}
 
-	slices.SortFunc(result, func(a, b migrationFile) int {
+	pending := make([]migrationFile, 0, len(files))
+	for _, file := range files {
+		// already applied
+		if file.Version <= cur {
+			continue
+		}
+		// beyond the target version
+		if opt.Version != VersionUp && file.Version > opt.Version {
+			continue
+		}
+		pending = append(pending, file)
+	}
+
+	slices.SortFunc(pending, func(a, b migrationFile) int {
 		return strings.Compare(a.Version, b.Version)
 	})
-	return result
+
+	return pending, nil
 }
 
-func filterDownMigrationFiles(files []string, opt Options) []migrationFile {
-	var result []migrationFile
+// migrateDownFiles returns the down migrations to apply, i.e. every file with
+// opt.Version < version <= cur, sorted descending.
+func migrateDownFiles(cur string, opt Options) ([]migrationFile, error) {
+	files, err := migrationFiles(opt.Source, suffixDown)
+	if err != nil {
+		return nil, err
+	}
+
+	pending := make([]migrationFile, 0, len(files))
 	for _, file := range files {
-		version := strings.Split(file, opt.VersionSeparator)[0]
-		if version < opt.Version && opt.Version != VersionDown {
+		// not applied yet
+		if file.Version > cur {
 			continue
 		}
-		// skip if version file is greater than or equal to current version, and repeat is not RepeatAll
-		if version > opt.curVersion && opt.Repeat != RepeatAll {
+		// at or below the target version: stays applied
+		if opt.Version != VersionDown && file.Version <= opt.Version {
 			continue
 		}
-		if version == opt.curVersion && opt.Repeat == NoRepeat {
-			continue
-		}
-
-		result = append(result, migrationFile{Version: version, Filename: file})
+		pending = append(pending, file)
 	}
 
-	slices.SortFunc(result, func(a, b migrationFile) int {
-		return strings.Compare(a.Version, b.Version)
+	slices.SortFunc(pending, func(a, b migrationFile) int {
+		return strings.Compare(b.Version, a.Version)
 	})
-	slices.Reverse(result)
-	return result
-}
 
-// execute
-
-func migrateUp(db *sql.DB, opt Options) error {
-	files, err := getMigrationFiles(opt.Source, SuffixUp)
-	if err != nil {
-		return err
-	}
-	migrations := filterUpMigrationFiles(files, opt)
-	for _, m := range migrations {
-		filename := path.Join(opt.Source, m.Filename)
-		b, err := os.ReadFile(filename)
-		if err != nil {
-			return err
-		}
-
-		statements := splitSQLStatements(b)
-		statements = append(statements, removeVersion(m.Version, opt), addVersion(m.Version, opt))
-		if err := execScripts(db, statements); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func migrateDown(db *sql.DB, opt Options) error {
-	files, err := getMigrationFiles(opt.Source, SuffixDown)
-	if err != nil {
-		return err
-	}
-	migrations := filterDownMigrationFiles(files, opt)
-	for _, m := range migrations {
-		filename := path.Join(opt.Source, m.Filename)
-		b, err := os.ReadFile(filename)
-		if err != nil {
-			return err
-		}
-
-		statements := splitSQLStatements(b)
-		statements = append(statements, removeVersion(m.Version, opt))
-		if err := execScripts(db, statements); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func addVersion(version string, opt Options) string {
-	return fmt.Sprintf("INSERT INTO %s (version) VALUES ('%s');", opt.TableName, version)
-}
-
-func removeVersion(version string, opt Options) string {
-	return fmt.Sprintf("DELETE FROM %s WHERE version = '%s'", opt.TableName, version)
-}
-
-func execScripts(db *sql.DB, statements []string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	commit := false
-	defer func() {
-		if commit {
-			return
-		}
-		_ = tx.Rollback()
-	}()
-
-	for _, stmt := range statements {
-		if _, err := tx.Exec(stmt); err != nil {
-			return err
-		}
-	}
-
-	err = tx.Commit()
-	commit = err == nil
-	return err
-}
-
-func splitSQLStatements(query []byte) []string {
-	script := string(query)
-	statements := make([]string, 0)
-	var builder strings.Builder
-
-	inSingleQuote := false
-	inDoubleQuote := false
-	inBacktickQuote := false
-	inLineComment := false
-	inBlockComment := false
-
-	for i := 0; i < len(script); i++ {
-		ch := script[i]
-		next := byte(0)
-		if i+1 < len(script) {
-			next = script[i+1]
-		}
-
-		if inLineComment {
-			if ch == '\n' {
-				inLineComment = false
-				builder.WriteByte(ch)
-			}
-			continue
-		}
-
-		if inBlockComment {
-			if ch == '*' && next == '/' {
-				i++
-				inBlockComment = false
-				builder.WriteByte(' ')
-			}
-			continue
-		}
-
-		if inSingleQuote {
-			builder.WriteByte(ch)
-			if ch == '\\' && next != 0 {
-				builder.WriteByte(next)
-				i++
-				continue
-			}
-			if ch == '\'' {
-				if next == '\'' {
-					builder.WriteByte(next)
-					i++
-					continue
-				}
-				inSingleQuote = false
-			}
-			continue
-		}
-
-		if inDoubleQuote {
-			builder.WriteByte(ch)
-			if ch == '\\' && next != 0 {
-				builder.WriteByte(next)
-				i++
-				continue
-			}
-			if ch == '"' {
-				if next == '"' {
-					builder.WriteByte(next)
-					i++
-					continue
-				}
-				inDoubleQuote = false
-			}
-			continue
-		}
-
-		if inBacktickQuote {
-			builder.WriteByte(ch)
-			if ch == '`' {
-				if next == '`' {
-					builder.WriteByte(next)
-					i++
-					continue
-				}
-				inBacktickQuote = false
-			}
-			continue
-		}
-
-		if ch == '-' && next == '-' {
-			i++
-			inLineComment = true
-			continue
-		}
-
-		if ch == '/' && next == '*' {
-			i++
-			inBlockComment = true
-			continue
-		}
-
-		switch ch {
-		case '\'':
-			inSingleQuote = true
-			builder.WriteByte(ch)
-		case '"':
-			inDoubleQuote = true
-			builder.WriteByte(ch)
-		case '`':
-			inBacktickQuote = true
-			builder.WriteByte(ch)
-		case ';':
-			statement := strings.TrimSpace(builder.String())
-			if statement != "" {
-				statements = append(statements, statement)
-			}
-			builder.Reset()
-		default:
-			builder.WriteByte(ch)
-		}
-	}
-
-	statement := strings.TrimSpace(builder.String())
-	if statement != "" {
-		statements = append(statements, statement)
-	}
-
-	return statements
+	return pending, nil
 }
